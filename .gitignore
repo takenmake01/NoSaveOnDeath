@@ -1,0 +1,7 @@
+types/
+*.code-workspace
+*.js
+*.js.map
+tsconfig.json
+.eslintignore
+.eslintrc.json
