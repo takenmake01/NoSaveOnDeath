@@ -56,7 +56,7 @@ class NoSaveOnDeath implements IPreSptLoadMod
         const isSurvived = locationLifeCycleService.isPlayerSurvived(request.results);
 
         // break out before saving if the player dies
-        if (isDead) return;
+        if (isDead && isPmc) return;
 
         // Handle items transferred via BTR or transit to player mailbox
         locationLifeCycleService.handleItemTransferEvent(sessionId, request);
