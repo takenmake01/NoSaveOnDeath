@@ -1,100 +1,97 @@
-﻿using SPTarkov.DI.Annotations;
+using System.Reflection;
+using SPTarkov.Common.Models.Logging;
+using SPTarkov.DI.Annotations;
+using SPTarkov.Reflection.Patching;
 using SPTarkov.Server.Core.DI;
-using SPTarkov.Server.Core.Models.Spt.Mod;
-using LogLevel = SPTarkov.Server.Core.Models.Spt.Logging.LogLevel;
-using SPTarkov.Server.Core.Models.Utils;
-using SPTarkov.Server.Core.Servers;
-using SPTarkov.Server.Core.Services;
-using SPTarkov.Server.Core.Utils;
-
-using SPTarkov.Server.Core.Helpers;
-using SPTarkov.Server.Core.Utils.Cloners;
-using SPTarkov.Server.Core.Generators;
+using SPTarkov.Server.Core.Extensions;
 using SPTarkov.Server.Core.Models.Common;
 using SPTarkov.Server.Core.Models.Eft.Match;
-using SPTarkov.Server.Core.Extensions;
-
-
+using SPTarkov.Server.Core.Models.Spt.Config;
+using SPTarkov.Server.Core.Models.Spt.Mod;
+using SPTarkov.Server.Core.Services.Bot;
+using SPTarkov.Server.Core.Services.InRaid;
 
 namespace NoSaveOnDeath;
 
-public record ModMetadata : AbstractModMetadata
+public record ModMetadata : IModMetadata
 {
-    public override string ModGuid { get; init; } = "com.takenmake.nosaveondeath";
-    public override string Name { get; init; } = "NoSaveOnDeath";
-    public override string Author { get; init; } = "takenmake";
-    public override List<string>? Contributors { get; init; }
-    public override SemanticVersioning.Version Version { get; init; } = new("3.0.0");
-    public override SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
-    
-    
-    public override List<string>? Incompatibilities { get; init; }
-    public override Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
-    public override string? Url { get; init; }
-    public override bool? IsBundleMod { get; init; }
-    public override string License { get; init; } = "MIT";
+    public string ModGuid { get; init; } = "com.takenmake.nosaveondeath";
+    public string Name { get; init; } = "NoSaveOnDeath";
+    public string Author { get; init; } = "takenmake";
+    public List<string>? Contributors { get; init; }
+    public SemanticVersioning.Version Version { get; init; } = new("3.0.0");
+    public SemanticVersioning.Range SptVersion { get; init; } = new("~4.1.0");
+
+
+    public List<string>? Incompatibilities { get; init; }
+    public Dictionary<string, SemanticVersioning.Range>? ModDependencies { get; init; }
+    public string? Url { get; init; }
+    public string License { get; init; } = "MIT";
+    public bool HasPrepatcher { get; init; } = false;
 }
 
-[Injectable()]
-public class OverrideMethod(
+// SPT 4.1 made LocationLifecycleService's methods non-virtual, so the raid end is intercepted with a Harmony patch instead
+[Injectable(TypePriority = OnLoadOrder.Preload)]
+public class NoSaveOnDeathLoader(
     ISptLogger<LocationLifecycleService> logger,
-    RewardHelper rewardHelper,
-    ConfigServer configServer,
-    TimeUtil timeUtil,
-    DatabaseService databaseService,
-    ProfileHelper profileHelper,
-    BackupService backupService,
-    ProfileActivityService profileActivityService,
-    BotNameService botNameService,
-    ICloner cloner,
-    RaidTimeAdjustmentService raidTimeAdjustmentService,
-    LocationLootGenerator locationLootGenerator,
-    ServerLocalisationService serverLocalisationService,
     BotLootCacheService botLootCacheService,
-    LootGenerator lootGenerator,
-    MailSendService mailSendService,
-    TraderHelper traderHelper,
-    RandomUtil randomUtil,
-    InRaidHelper inRaidHelper,
-    PlayerScavGenerator playerScavGenerator,
-    SaveServer saveServer,
-    HealthHelper healthHelper,
-    PmcChatResponseService pmcChatResponseService,
-    PmcWaveGenerator pmcWaveGenerator,
-    QuestHelper questHelper,
-    InsuranceService insuranceService,
-    MatchBotDetailsCacheService matchBotDetailsCacheService,
-    BtrDeliveryService btrDeliveryService)
-    : LocationLifecycleService(logger, rewardHelper, configServer, timeUtil, databaseService, profileHelper,
-        backupService, profileActivityService, botNameService, cloner, raidTimeAdjustmentService,
-        locationLootGenerator, serverLocalisationService, botLootCacheService, lootGenerator, mailSendService,
-        traderHelper, randomUtil, inRaidHelper, playerScavGenerator, saveServer, healthHelper, pmcChatResponseService,
-        pmcWaveGenerator, questHelper, insuranceService, matchBotDetailsCacheService, btrDeliveryService)
+    RagfairConfig ragfairConfig,
+    HideoutConfig hideoutConfig) : IOnLoad
 {
-
-    public override void EndLocalRaid(MongoId sessionId, EndLocalRaidRequestData request)
+    public Task OnLoadAsync(CancellationToken cancellationToken)
     {
-        logger.Success("[NoSaveOnDeath] Overriding EndLocalRaid...");
-        
-        if (request.Results != null && request.Results.IsPlayerDead()) 
-        {
-            botLootCacheService.ClearCache();
+        EndLocalRaidPatch.Logger = logger;
+        EndLocalRaidPatch.BotLootCacheService = botLootCacheService;
+        EndLocalRaidPatch.RagfairConfig = ragfairConfig;
+        EndLocalRaidPatch.HideoutConfig = hideoutConfig;
 
-            if (logger.IsLogEnabled(LogLevel.Debug))
+        new EndLocalRaidPatch().Enable();
+
+        logger.Success("[NoSaveOnDeath] EndLocalRaid patch loaded");
+
+        return Task.CompletedTask;
+    }
+}
+
+public class EndLocalRaidPatch : AbstractPatch
+{
+    internal static ISptLogger<LocationLifecycleService> Logger = null!;
+    internal static BotLootCacheService BotLootCacheService = null!;
+    internal static RagfairConfig RagfairConfig = null!;
+    internal static HideoutConfig HideoutConfig = null!;
+
+    protected override MethodBase GetTargetMethod()
+    {
+        return typeof(LocationLifecycleService).GetMethod(nameof(LocationLifecycleService.EndLocalRaidAsync))!;
+    }
+
+    [PatchPrefix]
+    public static bool Prefix(MongoId sessionId, EndLocalRaidRequestData request, ref Task __result)
+    {
+        Logger.Success("[NoSaveOnDeath] Overriding EndLocalRaid...");
+
+        if (request.Results != null && request.Results.IsPlayerDead())
+        {
+            // Same out-of-raid cleanup the original method does before it saves the profile
+            BotLootCacheService.ClearCache();
+
+            if (Logger.IsLogEnabled(LogLevel.Debug))
             {
-                logger.Debug($"Raid: {request.ServerId} outcome: {request.Results.Result}");
+                Logger.Debug($"Raid: {request.ServerId} outcome: {request.Results.Result}");
             }
 
             RagfairConfig.RunIntervalSeconds = RagfairConfig.RunIntervalValues.OutOfRaid;
             HideoutConfig.RunIntervalSeconds = HideoutConfig.RunIntervalValues.OutOfRaid;
 
-            logger.Success("[NoSaveOnDeath] Player died, skipping save");
+            Logger.Success("[NoSaveOnDeath] Player died, skipping save");
 
-            return;
+            // Skipping an async method still has to hand the caller a Task to await
+            __result = Task.CompletedTask;
+            return false;
         }
 
-        logger.Success("[NoSaveOnDeath] Player survived, saving normally");
-    
-        base.EndLocalRaid(sessionId, request);
+        Logger.Success("[NoSaveOnDeath] Player survived, saving normally");
+
+        return true;
     }
 }
